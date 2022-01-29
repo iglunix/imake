@@ -12,7 +12,10 @@ use std::{
 // Global makefile state
 #[derive(Default, Debug)]
 struct State {
+    fullname: String,
     basename: String,
+    dirname: String,
+    curdir: String,
     vars: HashMap<String, String>,
     always_make: bool,
     targets_to_make: Vec<String>,
@@ -37,8 +40,7 @@ fn main() -> Result<(), u32> {
 
     let mut state = State::default();
 
-    let mpath = args.next().unwrap().trim().into();
-
+    let mpath: String = args.next().unwrap().trim().into();
     state.basename = Path::new(&mpath)
         .file_name()
         .unwrap()
@@ -46,6 +48,17 @@ fn main() -> Result<(), u32> {
         .into_string()
         .unwrap();
 
+    state.dirname = Path::new(&mpath)
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into();
+
+    let olddir: String = std::env::current_dir().unwrap().to_str().unwrap().into();
+    state.curdir = olddir.clone();
+
+    state.fullname = mpath.clone();
     state.vars.insert("MAKE".into(), mpath);
 
     for (a, b) in std::env::vars() {
@@ -54,6 +67,8 @@ fn main() -> Result<(), u32> {
     state.vars.insert("SHELL".into(), "/bin/sh".into());
 
     let mut makeflags = String::new();
+
+    let mut dashC = false;
 
     while let Some(arg) = args.next() {
         let mut sargs = vec![];
@@ -80,20 +95,33 @@ fn main() -> Result<(), u32> {
                 "i" | "--ignore-errors" => {
                     state.ignore_errors = true;
                 }
-                s if s.starts_with("--directory=") || s == "-C" => {
-                    // Change to DIRECTORY before doing anything
+                s if s.starts_with("--directory=") => {
+
+                }
+                "C" => {
+                    let dir = args.next().expect("no dir provided");
+                    std::env::set_current_dir(Path::new(&dir)).unwrap();
+                    state.curdir = std::env::current_dir().unwrap().to_str().unwrap().into();
+                    dashC = true;
                 }
                 "v" | "--version" => {
                     println!("GNU Make 4.3 Compatible Iglunix Make");
                     return Ok(());
                 }
-                "f" => makefile_names = vec![args.next().expect("")],
+                "f" => {
+                    let mut n = args.next().expect("");
+
+                    makefile_names = vec![n]
+                },
                 "s" | "--silent" | "--quiet" => {
                     state.silent = true;
                     makeflags.push('s');
                 }
                 "n" | "--just-print" | "--dry-run" | "--recon" => {
                     state.dryrun = true;
+                }
+                "--no-silent" => {
+                    state.silent = false;
                 }
                 a if !a.starts_with('-') => {
                     let mut l = String::new();
@@ -129,8 +157,23 @@ fn main() -> Result<(), u32> {
     let makefile = makefile_names
         .into_iter()
         .find(|name| Path::new(&name).exists())
-        .expect("No makefiles found");
-    state_machine(state, &makefile)
+        .expect("No makefiles found")
+        .clone();
+
+    let mut leaving = None;
+
+    if !state.silent && dashC {
+        println!("{}: Entering directory '{}'", state.basename, state.curdir);
+        leaving = Some(format!("{}: Leaving directory '{}'", state.basename, state.curdir));
+    }
+
+    let r = state_machine(state, &makefile);
+
+    if let Some(l) = leaving {
+        eprintln!("{}", l);
+    }
+    
+    r
 }
 
 #[derive(Default)]
@@ -320,11 +363,13 @@ enum SubType {
     Var,
     Info,
     Shell,
+    Subst,
+    Warn
 }
 
 /// - `stack` - Output characters
 /// - `src` - The src string to read from.
-fn expand(state: &mut State, rule: Option<&TargetRule>, stack: &mut String) {
+fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &mut String) {
     // $ must have been consumed already
     match stack.pop() {
         Some(e) if e == '(' || e == '{' => {
@@ -336,7 +381,7 @@ fn expand(state: &mut State, rule: Option<&TargetRule>, stack: &mut String) {
                 Some(a) if a == if e == '(' { ')' } else { '}' } => false,
                 Some('$') => {
                     expanded = true;
-                    expand(state, rule, stack);
+                    expand(state, loc, rule, stack);
                     true
                 }
                 Some(' ') if !expanded && !in_fun => {
@@ -348,6 +393,14 @@ fn expand(state: &mut State, rule: Option<&TargetRule>, stack: &mut String) {
                         }
                         "shell" => {
                             sub_type = SubType::Shell;
+                            var_name = String::new();
+                        }
+                        "subst" => {
+                            sub_type = SubType::Subst;
+                            var_name = String::new();
+                        }
+                        "warning" => {
+                            sub_type = SubType::Warn;
                             var_name = String::new();
                         }
                         _ => {
@@ -377,18 +430,49 @@ fn expand(state: &mut State, rule: Option<&TargetRule>, stack: &mut String) {
                     println!("{}", var_name);
                 }
                 SubType::Shell => {
-                    let out = Command::new("sh")
-                        .arg("-c")
-                        .arg(process_for_shell(&var_name))
-                        .output()
-                        .expect("Command failed to execute");
-                    let s = String::from_utf8(out.stdout).unwrap();
-                    stack.extend(s.chars().rev());
 
-                    state.vars.insert(
-                        ".SHELLSTATUS".into(),
-                        format!("{}", out.status.code().unwrap_or_default()),
-                    );
+                    let cmd = process_for_shell(&var_name);
+
+                    let cmd_name = cmd.split_whitespace().next().unwrap();
+
+                    let cnf_status = Command::new("/bin/sh")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .arg("-c")
+                        .arg(format!("command -V {}", cmd_name))
+                        .status()
+                        .expect("command failed");
+                    if !cnf_status.success() {
+                        eprintln!("{}: {}: No such file or directory", state.basename, cmd_name);
+                        state.vars.insert(
+                            ".SHELLSTATUS".into(),
+                            "127".into()
+                        );
+                    } else {
+                        let out = Command::new("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .output()
+                            .expect("Command failed to execute");
+                        let s = String::from_utf8(out.stdout).unwrap();
+                        stack.extend(s.chars().rev());
+
+                        state.vars.insert(
+                            ".SHELLSTATUS".into(),
+                            format!("{}", out.status.code().unwrap_or_default()),
+                        );
+                    }
+                }
+                SubType::Subst => {
+                    let mut args = var_name.split(",");
+                    let from = args.next().unwrap();
+                    let to = args.next().unwrap();
+                    let text = args.next().unwrap();
+                    let out = text.replace(from, to);
+                    stack.extend(out.chars().rev());
+                }
+                SubType::Warn => {
+                    eprintln!("{}:{}: {}", loc.file_name, loc.line, var_name);
                 }
             }
         }
@@ -481,7 +565,7 @@ fn process_lines(state: &mut State, file_name: &str) {
                             out.push('$');
                         }
                         '$' if !stop_expanding => {
-                            expand(state, None, &mut stack);
+                            expand(state, &location, None, &mut stack);
                         }
                         '=' if !matches!(context, Context::Var(_) | Context::Rule(..)) => {
                             context = Context::Var(out);
@@ -655,7 +739,6 @@ fn process_target(state: &mut State, name: &str) {
                         }
 
                         eprintln!("WARNING: overwriting previous recipies for {}", name);
-                        eprintln!("{:#?}", recipies);
                         recipies = Vec::new();
                     }
                     was_recipies = true;
@@ -695,6 +778,8 @@ fn process_target(state: &mut State, name: &str) {
     }
 
     if needs_updating {
+        let mut expanded = Vec::new();
+        
         for (loc, r) in &recipies {
             let mut stack: String = r.chars().rev().collect();
             let mut cmd = String::new();
@@ -705,7 +790,7 @@ fn process_target(state: &mut State, name: &str) {
                         cmd.push(stack.pop().unwrap());
                     }
                     '$' => {
-                        expand(state, Some(&mut target_rule), &mut stack);
+                        expand(state, &loc, Some(&mut target_rule), &mut stack);
                     }
                     a => {
                         cmd.push(a);
@@ -719,6 +804,11 @@ fn process_target(state: &mut State, name: &str) {
                 continue;
             }
 
+            expanded.push((loc.clone(), cmd.to_string()));
+        }
+
+        for (loc, cmd) in &expanded {
+            let mut cmd = cmd.as_str();
             let ignore_errors = if cmd.starts_with('-') {
                 cmd = &cmd[1..];
                 true
@@ -727,15 +817,15 @@ fn process_target(state: &mut State, name: &str) {
                 state.ignore_errors
             };
 
-            let mut silent = state.silent;
+            let mut silent = false;
 
             if cmd.starts_with('@') {
                 cmd = &cmd[1..];
                 silent = true;
             }
 
-            if !silent || state.dryrun {
-                eprintln!("{}", cmd);
+            if (!silent || state.dryrun) && !state.silent {
+                println!("{}", cmd);
             }
 
             let cmd_name = cmd.trim().split_ascii_whitespace().next().unwrap();
@@ -770,6 +860,16 @@ fn process_target(state: &mut State, name: &str) {
                 continue;
             }
 
+            let mut leaving = None;
+
+            if !silent && cmd_name == state.fullname {
+                println!("{}[1]: Entering directory '{}'", state.basename, state.curdir);
+                leaving = Some(format!("{}[1]: Leaving directory '{}'", state.basename, state.curdir));
+            } else {
+            }
+
+            
+
             let status = Command::new("/bin/sh")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -798,6 +898,8 @@ fn process_target(state: &mut State, name: &str) {
                     );
                     std::process::exit(2);
                 }
+            } else if let Some(s) = leaving {
+                println!("{}", s);
             }
         }
     }
