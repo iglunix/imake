@@ -57,12 +57,14 @@ fn main() -> Result<(), u32> {
     state.curdir = olddir.clone();
 
     state.fullname = mpath.clone();
-    state.vars.insert("MAKE".into(), mpath);
+    state.vars.insert("MAKE".into(), mpath.clone());
+    std::env::set_var("MAKE", mpath);
 
     for (a, b) in std::env::vars() {
         state.vars.insert(a, b);
     }
     state.vars.insert("SHELL".into(), "/bin/sh".into());
+    std::env::set_var("SHELL", "/bin/sh");
 
     let level = std::env::var("MAKELEVEL")
         .ok()
@@ -314,12 +316,14 @@ fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut u
 }
 
 fn process_specials(state: &mut State) {
-    for t in &state.rules {
+    for t in &state.rules.clone() {
         if let Some(first_target) = t.targets.get(0) {
             match first_target.as_str() {
                 ".SILENT" => {
                     if let RuleData::Prereq(prereqs) = &t.data {
-                        state.silent_targets.extend(prereqs.clone());
+                        let mut stack = prereqs.clone();
+                        expand(state, &t.location, None, &mut stack);
+                        state.silent_targets.extend(stack.split_whitespace().map(|s| s.to_string()));
                     } else {
                         state.silent = true;
                     }
@@ -327,7 +331,9 @@ fn process_specials(state: &mut State) {
 
                 ".PHONY" => {
                     if let RuleData::Prereq(prereqs) = &t.data {
-                        state.phony.extend(prereqs.clone());
+                        let mut stack = prereqs.clone();
+                        expand(state, &t.location, None, &mut stack);
+                        state.phony.extend(stack.split_whitespace().map(|s| s.to_string()));
                     }
                 }
                 _ => {}
@@ -337,9 +343,9 @@ fn process_specials(state: &mut State) {
 }
 
 /// setsup some options aswell
-fn select_targets(state: &State) -> Vec<String> {
+fn select_targets(state: &mut State) -> Vec<String> {
     let mut best_matches = Vec::new();
-    for t in &state.rules {
+    for t in &state.rules.clone() {
         let first_target = t.targets.get(0).map(|x| x.clone());
         let first_target = first_target.unwrap_or_default();
         match t {
@@ -347,7 +353,9 @@ fn select_targets(state: &State) -> Vec<String> {
                 data: RuleData::Prereq(prereqs),
                 ..
             } if first_target == ".DEFAULT" => {
-                best_matches = prereqs.clone();
+                let mut stack = prereqs.clone();
+                expand(state, &t.location, None, &mut stack);                
+                best_matches = stack.split_whitespace().map(|s| s.to_string()).collect();
             }
 
             Rule { .. } if first_target.starts_with('.') => {}
@@ -396,6 +404,9 @@ enum SubType {
     Join,
     Dir,
     NotDir,
+    AbsPath,
+    FindString,
+    Error
 }
 
 /// - `stack` - Output characters
@@ -476,6 +487,18 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                         }
                         "dir" => {
                             sub_type = SubType::Dir;
+                            var_name = String::new();
+                        }
+                        "abspath" => {
+                            sub_type = SubType::AbsPath;
+                            var_name = String::new();
+                        }
+                        "findstring" => {
+                            sub_type = SubType::FindString;
+                            var_name = String::new();
+                        }
+                        "error" => {
+                            sub_type = SubType::Error;
                             var_name = String::new();
                         }
                         _ => {
@@ -721,6 +744,23 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                         stack.push(' ');
                     }
                 }
+                SubType::AbsPath => {
+                    stack.extend(var_name
+                        .split_whitespace()
+                        .map(|x| Path::new(x).canonicalize().map(|x| x.to_str().unwrap().to_string()).unwrap_or_default())
+                        .fold(String::new(), |s, x| format!("{} {}", s, x)).chars().rev());
+                }
+                SubType::FindString => {
+                    let mut args = var_name.split(',');
+                    let s = args.next().unwrap();
+                    if args.next().unwrap().contains(&s) {
+                        stack.extend(s.chars().rev());
+                    }
+                }
+                SubType::Error => {
+                    eprintln!("{}:{}: *** {}.  Stop.", loc.file_name, loc.line, var_name.trim());
+                    std::process::exit(2);
+                }
             }
         }
 
@@ -762,6 +802,12 @@ fn process_lines(state: &mut State, file_name: &str) {
     let mut file = BufReader::new(file);
     let mut eof = false;
 
+    // Depth of false ifs. if we reach one if statement that's false this gets
+    // incremented to 1. if we reach any other if statements whatever their outcome
+    // this gets incremented. if we reach endifs this gets decremented until it's at 0
+    // at which point we switch back to parsing things normally.
+    let mut in_false = 0;
+
     let mut location = Location {
         file_name: file_name.into(),
         line: 0,
@@ -771,167 +817,186 @@ fn process_lines(state: &mut State, file_name: &str) {
     let recipie_prefix = '\t';
     while !eof {
         let line = read_logical_line(&mut file, &mut eof, &mut location.line);
-        match line {
-            l if l.starts_with(recipie_prefix) && state.in_rule => {
-                let r = match state.rules.last() {
-                    Some(Rule {
-                        targets,
-                        data: RuleData::Prereq(..),
-                        ..
-                    })
-                    | Some(Rule {
-                        targets,
-                        data: RuleData::Recipie(..),
-                        ..
-                    }) => Rule {
-                        location: location.clone(),
-                        targets: targets.clone(),
-                        data: RuleData::Recipie(l),
-                    },
+        if in_false > 0 {
+            if line.trim().starts_with("ifdef ")
+                || line.trim().starts_with("ifndef ") {
+                in_false += 1;
+            } else if line.trim().starts_with("endif") {
+                in_false -= 1;
+            }
+        } else {
+            match line {
+                l if l.starts_with(recipie_prefix) && state.in_rule => {
+                    let r = match state.rules.last() {
+                        Some(Rule {
+                            targets,
+                            data: RuleData::Prereq(..),
+                            ..
+                        })
+                        | Some(Rule {
+                            targets,
+                            data: RuleData::Recipie(..),
+                            ..
+                        }) => Rule {
+                            location: location.clone(),
+                            targets: targets.clone(),
+                            data: RuleData::Recipie(l),
+                        },
 
-                    _ => panic!(),
-                };
-                state.rules.push(r);
-            }
-            l if l.starts_with(recipie_prefix) && !state.in_rule => {
-                panic!("Not currently within a rule");
-            }
-            l if l.starts_with("include ") => {
-                state.in_rule = false;
+                        _ => panic!(),
+                    };
+                    state.rules.push(r);
+                }
+                l if l.starts_with(recipie_prefix) && !state.in_rule => {
+                    panic!("Not currently within a rule");
+                }
+                l if l.starts_with("include ") => {
+                    state.in_rule = false;
 
-                process_lines(state, &l[8..].trim());
-            }
-            l if l.starts_with("-include ") | l.starts_with("sinclude ") => {
-                state.in_rule = false;
-                if Path::new(l[8..].trim()).exists() {
                     process_lines(state, &l[8..].trim());
                 }
-            }
-            l => {
-                let mut stack = l.chars().rev().collect::<String>();
-                let mut out = String::new();
-                let mut stop_expanding = false;
-                let mut context = Context::Unknown;
-                while let Some(c) = stack.pop() {
-                    match c {
-                        '$' if stack.ends_with('$') => {
-                            out.push(stack.pop().unwrap());
-                            out.push('$');
-                        }
-                        '$' if !stop_expanding => {
-                            expand(state, &location, None, &mut stack);
-                        }
-                        '=' if !matches!(context, Context::Var(_) | Context::Rule(..)) => {
-                            context = Context::Var(out);
-                            out = String::new();
-                            stop_expanding = true;
-                        }
-                        ':' if !matches!(context, Context::Var(_)) => match stack.pop() {
-                            Some('=') => {
-                                context = Context::Var(out);
-                                out = String::new();
-                            }
-                            Some(':') => {
-                                match stack.pop() {
-                                    Some('=') => {
-                                        context = Context::Var(out);
-                                        out = String::new();
-                                    }
-                                    Some(a) => {
-                                        context = Context::Rule(out, None, Vec::new());
-                                        out = String::new();
-                                        stack.push(a);
-                                        stop_expanding = true;
-                                    }
-                                    None => {
-                                        context = Context::Rule(out, None, Vec::new());
-                                        out = String::new();
-                                        stop_expanding = true;
-                                    }
-                                }
-                            }
-                            Some(a) => {
-                                context = Context::Rule(out, None, Vec::new());
-                                out = String::new();
-                                stack.push(a);
-                                stop_expanding = true;
-                            }
-                            None => {
-                                context = Context::Rule(out, None, Vec::new());
-                                out = String::new();
-                                stop_expanding = true;
-                            }
-                        }
-                        ';' if let Context::Rule(a, None, v) = context => {
-                            stop_expanding = true;
-                            context = Context::Rule(a, Some(out), v);
-                            out = String::new();
-                        }
-                        ';' if let Context::Rule(a, Some(pre), v) = &mut context => {
-                            v.push(out);
-                            out = String::new();
-                        }
-                        a => {
-                            out.push(a);
-                        }
+                l if l.trim().starts_with("ifdef ") => {
+                    let var = l[6..].trim();
+                    if !state.vars.contains_key(var) {
+                        in_false += 1
                     }
                 }
-
-                match context {
-                    Context::Var(v) => {
-                        state.in_rule = false;
-                        state
-                            .vars
-                            .insert(v.trim().to_string(), out.trim().to_string());
+                l if l.trim().starts_with("ifdef ") => {
+                    let var = l[6..].trim();
+                    if state.vars.contains_key(var) {
+                        in_false += 1
                     }
-                    Context::Rule(targets, Some(prerequisites), recipies) => {
-                        let mut recipies = recipies;
-                        recipies.push(out);
+                }
+                l if l.trim().starts_with("endif") => {
+                    // TODO: in_true?
+                }
+                l if l.starts_with("-include ") | l.starts_with("sinclude ") => {
+                    state.in_rule = false;
+                    if Path::new(l[8..].trim()).exists() {
+                        process_lines(state, &l[8..].trim());
+                    }
+                }
+                l => {
+                    let mut stack = l.chars().rev().collect::<String>();
+                    let mut out = String::new();
+                    let mut stop_expanding = false;
+                    let mut context = Context::Unknown;
+                    while let Some(c) = stack.pop() {
+                        match c {
+                            '$' if stack.ends_with('$') => {
+                                out.push(stack.pop().unwrap());
+                                out.push('$');
+                            }
+                            '$' if !stop_expanding => {
+                                expand(state, &location, None, &mut stack);
+                            }
+                            '=' if !matches!(context, Context::Var(_) | Context::Rule(..)) => {
+                                context = Context::Var(out);
+                                out = String::new();
+                                stop_expanding = true;
+                            }
+                            ':' if !matches!(context, Context::Var(_)) => match stack.pop() {
+                                Some('=') => {
+                                    context = Context::Var(out);
+                                    out = String::new();
+                                }
+                                Some(':') => {
+                                    match stack.pop() {
+                                        Some('=') => {
+                                            context = Context::Var(out);
+                                            out = String::new();
+                                        }
+                                        Some(a) => {
+                                            context = Context::Rule(out, None, Vec::new());
+                                            out = String::new();
+                                            stack.push(a);
+                                            stop_expanding = true;
+                                        }
+                                        None => {
+                                            context = Context::Rule(out, None, Vec::new());
+                                            out = String::new();
+                                            stop_expanding = true;
+                                        }
+                                    }
+                                }
+                                Some(a) => {
+                                    context = Context::Rule(out, None, Vec::new());
+                                    out = String::new();
+                                    stack.push(a);
+                                    stop_expanding = true;
+                                }
+                                None => {
+                                    context = Context::Rule(out, None, Vec::new());
+                                    out = String::new();
+                                    stop_expanding = true;
+                                }
+                            }
+                            ';' if let Context::Rule(a, None, v) = context => {
+                                stop_expanding = true;
+                                context = Context::Rule(a, Some(out), v);
+                                out = String::new();
+                            }
+                            ';' if let Context::Rule(a, Some(pre), v) = &mut context => {
+                                v.push(out);
+                                out = String::new();
+                            }
+                            a => {
+                                out.push(a);
+                            }
+                        }
+                    }
 
-                        if targets.trim() != ".PHONY" {
-                            state.in_rule = true;
-                            let targets: Vec<String> = targets
-                                .split_ascii_whitespace()
-                                .map(|s| s.trim().into())
-                                .collect();
-                            state.rules.push(Rule {
-                                location: location.clone(),
-                                targets: targets.clone(),
-                                data: RuleData::Prereq(
-                                    prerequisites
-                                        .split_ascii_whitespace()
-                                        .map(|s| s.trim().into())
-                                        .collect(),
-                                ),
-                            });
-                            for r in recipies {
+                    match context {
+                        Context::Var(v) => {
+                            state.in_rule = false;
+                            state
+                                .vars
+                                .insert(v.trim().to_string(), out.trim().to_string());
+                        }
+                        Context::Rule(targets, Some(prerequisites), recipies) => {
+                            let mut recipies = recipies;
+                            recipies.push(out);
+
+                            if targets.trim() != ".PHONY" {
+                                state.in_rule = true;
+                                let targets: Vec<String> = targets
+                                    .split_ascii_whitespace()
+                                    .map(|s| s.trim().into())
+                                    .collect();
                                 state.rules.push(Rule {
                                     location: location.clone(),
                                     targets: targets.clone(),
-                                    data: RuleData::Recipie(r),
-                                })
+                                    data: RuleData::Prereq(
+                                        prerequisites
+                                    ),
+                                });
+                                for r in recipies {
+                                    state.rules.push(Rule {
+                                        location: location.clone(),
+                                        targets: targets.clone(),
+                                        data: RuleData::Recipie(r),
+                                    })
+                                }
                             }
                         }
-                    }
-                    Context::Rule(targets, None, _) => {
-                        if targets.trim() != ".PHONY" {
-                            state.in_rule = true;
-                            let targets: Vec<String> = targets
-                                .split_ascii_whitespace()
-                                .map(|s| s.trim().into())
-                                .collect();
-                            state.rules.push(Rule {
-                                location: location.clone(),
-                                targets: targets,
-                                data: RuleData::Prereq(
-                                    out.split_ascii_whitespace()
-                                        .map(|s| s.trim().into())
-                                        .collect(),
-                                ),
-                            });
+                        Context::Rule(targets, None, _) => {
+                            if targets.trim() != ".PHONY" {
+                                state.in_rule = true;
+                                let targets: Vec<String> = targets
+                                    .split_ascii_whitespace()
+                                    .map(|s| s.trim().into())
+                                    .collect();
+                                state.rules.push(Rule {
+                                    location: location.clone(),
+                                    targets: targets,
+                                    data: RuleData::Prereq(
+                                        out,
+                                    ),
+                                });
+                            }
                         }
+                        c => {}
                     }
-                    c => {}
                 }
             }
         }
@@ -961,7 +1026,7 @@ struct Rule {
 
 #[derive(Debug, Clone)]
 enum RuleData {
-    Prereq(Vec<String>),
+    Prereq(String),
     Var(Vec<(String, String)>),
     Recipie(String),
 }
@@ -989,7 +1054,7 @@ fn process_target(state: &mut State, name: &str) {
 
     let mut was_prereq = false;
     let mut was_recipies = false;
-    for rule in &state.rules {
+    for rule in &state.rules.clone() {
         if rule.targets.contains(&name.to_owned()) {
             match &rule.data {
                 RuleData::Var(vars) => {
@@ -1001,7 +1066,24 @@ fn process_target(state: &mut State, name: &str) {
                     was_recipies = false;
                 }
                 RuleData::Prereq(prereqs) => {
-                    target_rule.prerequisites.extend(prereqs.clone());
+                    let mut stack: String = prereqs.chars().rev().collect();
+                    let mut prereqs = String::new();
+
+                    while let Some(c) = stack.pop() {
+                        match c {
+                            '$' if stack.ends_with('$') => {
+                                prereqs.push(stack.pop().unwrap());
+                            }
+                            '$' => {
+                                expand(state, &rule.location, Some(&mut target_rule), &mut stack);
+                            }
+                            a => {
+                                prereqs.push(a);
+                            }
+                        }
+                    }
+
+                    target_rule.prerequisites.extend(prereqs.split_whitespace().map(|s| s.to_string()));
                     was_prereq = true;
                     was_recipies = false;
                 }
@@ -1097,7 +1179,7 @@ fn process_target(state: &mut State, name: &str) {
             }
 
             if (!silent || state.dryrun) && !state.silent {
-                println!("{}", cmd);
+               println!("{}", cmd);
             }
 
             let cmd_name = cmd.trim().split_ascii_whitespace().next().unwrap();
@@ -1105,12 +1187,10 @@ fn process_target(state: &mut State, name: &str) {
                 .arg0(&state.basename)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .envs(state.vars.iter())
                 .arg("-c")
                 .arg(format!("command -V {}", cmd_name))
-                .status()
-                .expect("command failed");
-            if !cnf_status.success() {
+                .status();
+            if cnf_status.is_err() || !cnf_status.unwrap().success() {
                 eprintln!(
                     "{}: {}: No such file or directory",
                     state.basename, cmd_name
@@ -1135,6 +1215,8 @@ fn process_target(state: &mut State, name: &str) {
 
             let mut leaving = None;
 
+            std::env::set_var("MAKELEVEL", (state.vars.get("MAKELEVEL").unwrap().parse::<u32>().unwrap() + 1).to_string());
+
             if !silent && cmd_name == state.fullname {
                 println!(
                     "{}[1]: Entering directory '{}'",
@@ -1148,16 +1230,9 @@ fn process_target(state: &mut State, name: &str) {
             }
 
             let status = Command::new("/bin/sh")
-                .arg0(&state.basename)
+                // .arg0(&state.basename)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .envs(state.vars.clone().into_iter().map(|(x, y)| {
-                    if x == "MAKELEVEL" {
-                        (x, (y.parse::<u32>().unwrap() + 1).to_string())
-                    } else {
-                        (x, y)
-                    }
-                }))
                 .arg("-c")
                 .arg(cmd)
                 .status()
