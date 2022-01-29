@@ -22,11 +22,12 @@ cd make-$VER
 
 [ -L make ] || ln -s ../../target/debug/imake make
 # [ -L make ] || ln -s /usr/bin/ckati make
+# [ -L make ] || ln -s /usr/bad/gmake/bin/gmake make
 
 [ -f Makefile ] || ./configure
 
 set +e
-make check-regression
+make check-regression MAKETESTFLAGS=''
 
 # kill any stray make processes
 killall make

@@ -5,6 +5,7 @@ use std::{
     fs::File,
     io::{prelude::*, BufReader},
     iter::Peekable,
+    os::unix::process::CommandExt,
     path::Path,
     process::{Command, Stdio},
 };
@@ -24,8 +25,10 @@ struct State {
     in_rule: bool,
     ignore_errors: bool,
     dryrun: bool,
+    keep_going: bool,
     /// List of phony target names
     phony: Vec<String>,
+    silent_targets: Vec<String>,
     processed: Vec<String>,
 }
 
@@ -33,9 +36,9 @@ fn main() -> Result<(), u32> {
     let mut args = std::env::args();
 
     let mut makefile_names = vec![
-        "Makefile".to_owned(),
+        "GNUmakefile".to_owned(),
         "makefile".to_owned(),
-        "GNUMakefile".to_owned(),
+        "Makefile".to_owned(),
     ];
 
     let mut state = State::default();
@@ -48,12 +51,7 @@ fn main() -> Result<(), u32> {
         .into_string()
         .unwrap();
 
-    state.dirname = Path::new(&mpath)
-        .parent()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .into();
+    state.dirname = Path::new(&mpath).parent().unwrap().to_str().unwrap().into();
 
     let olddir: String = std::env::current_dir().unwrap().to_str().unwrap().into();
     state.curdir = olddir.clone();
@@ -65,6 +63,14 @@ fn main() -> Result<(), u32> {
         state.vars.insert(a, b);
     }
     state.vars.insert("SHELL".into(), "/bin/sh".into());
+
+    let level = std::env::var("MAKELEVEL")
+        .ok()
+        .unwrap_or_default()
+        .parse::<u32>()
+        .map_or(0, |x| x + 1)
+        .to_string();
+    state.vars.insert("MAKELEVEL".into(), level);
 
     let mut makeflags = String::new();
 
@@ -95,9 +101,7 @@ fn main() -> Result<(), u32> {
                 "i" | "--ignore-errors" => {
                     state.ignore_errors = true;
                 }
-                s if s.starts_with("--directory=") => {
-
-                }
+                s if s.starts_with("--directory=") => {}
                 "C" => {
                     let dir = args.next().expect("no dir provided");
                     std::env::set_current_dir(Path::new(&dir)).unwrap();
@@ -112,7 +116,7 @@ fn main() -> Result<(), u32> {
                     let mut n = args.next().expect("");
 
                     makefile_names = vec![n]
-                },
+                }
                 "s" | "--silent" | "--quiet" => {
                     state.silent = true;
                     makeflags.push('s');
@@ -120,8 +124,14 @@ fn main() -> Result<(), u32> {
                 "n" | "--just-print" | "--dry-run" | "--recon" => {
                     state.dryrun = true;
                 }
+                "k" | "--keep-going" => {
+                    state.keep_going = true;
+                }
                 "--no-silent" => {
                     state.silent = false;
+                }
+                "--no-print-directory" => {
+                    // TODO:
                 }
                 a if !a.starts_with('-') => {
                     let mut l = String::new();
@@ -164,7 +174,10 @@ fn main() -> Result<(), u32> {
 
     if !state.silent && dashC {
         println!("{}: Entering directory '{}'", state.basename, state.curdir);
-        leaving = Some(format!("{}: Leaving directory '{}'", state.basename, state.curdir));
+        leaving = Some(format!(
+            "{}: Leaving directory '{}'",
+            state.basename, state.curdir
+        ));
     }
 
     let r = state_machine(state, &makefile);
@@ -172,7 +185,7 @@ fn main() -> Result<(), u32> {
     if let Some(l) = leaving {
         eprintln!("{}", l);
     }
-    
+
     r
 }
 
@@ -304,7 +317,14 @@ fn process_specials(state: &mut State) {
     for t in &state.rules {
         if let Some(first_target) = t.targets.get(0) {
             match first_target.as_str() {
-                ".SILENT" => state.silent = true,
+                ".SILENT" => {
+                    if let RuleData::Prereq(prereqs) = &t.data {
+                        state.silent_targets.extend(prereqs.clone());
+                    } else {
+                        state.silent = true;
+                    }
+                }
+
                 ".PHONY" => {
                     if let RuleData::Prereq(prereqs) = &t.data {
                         state.phony.extend(prereqs.clone());
@@ -364,7 +384,18 @@ enum SubType {
     Info,
     Shell,
     Subst,
-    Warn
+    Warn,
+    BaseName,
+    AddPrefix,
+    AddSuffix,
+    Sort,
+    FirstWord,
+    LastWord,
+    Words,
+    Suffix,
+    Join,
+    Dir,
+    NotDir,
 }
 
 /// - `stack` - Output characters
@@ -403,6 +434,50 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                             sub_type = SubType::Warn;
                             var_name = String::new();
                         }
+                        "basename" => {
+                            sub_type = SubType::BaseName;
+                            var_name = String::new();
+                        }
+                        "addprefix" => {
+                            sub_type = SubType::AddPrefix;
+                            var_name = String::new();
+                        }
+                        "addsuffix" => {
+                            sub_type = SubType::AddSuffix;
+                            var_name = String::new();
+                        }
+                        "sort" => {
+                            sub_type = SubType::Sort;
+                            var_name = String::new();
+                        }
+                        "firstword" => {
+                            sub_type = SubType::FirstWord;
+                            var_name = String::new();
+                        }
+                        "lastword" => {
+                            sub_type = SubType::LastWord;
+                            var_name = String::new();
+                        }
+                        "words" => {
+                            sub_type = SubType::Words;
+                            var_name = String::new();
+                        }
+                        "suffix" => {
+                            sub_type = SubType::Suffix;
+                            var_name = String::new();
+                        }
+                        "join" => {
+                            sub_type = SubType::Join;
+                            var_name = String::new();
+                        }
+                        "notdir" => {
+                            sub_type = SubType::NotDir;
+                            var_name = String::new();
+                        }
+                        "dir" => {
+                            sub_type = SubType::Dir;
+                            var_name = String::new();
+                        }
                         _ => {
                             var_name = String::new();
                         }
@@ -430,12 +505,12 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                     println!("{}", var_name);
                 }
                 SubType::Shell => {
-
                     let cmd = process_for_shell(&var_name);
 
                     let cmd_name = cmd.split_whitespace().next().unwrap();
 
                     let cnf_status = Command::new("/bin/sh")
+                        .arg0(&state.basename)
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .arg("-c")
@@ -443,13 +518,14 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                         .status()
                         .expect("command failed");
                     if !cnf_status.success() {
-                        eprintln!("{}: {}: No such file or directory", state.basename, cmd_name);
-                        state.vars.insert(
-                            ".SHELLSTATUS".into(),
-                            "127".into()
+                        eprintln!(
+                            "{}: {}: No such file or directory",
+                            state.basename, cmd_name
                         );
+                        state.vars.insert(".SHELLSTATUS".into(), "127".into());
                     } else {
-                        let out = Command::new("sh")
+                        let out = Command::new("/bin/sh")
+                            .arg0(&state.basename)
                             .arg("-c")
                             .arg(cmd)
                             .output()
@@ -473,6 +549,177 @@ fn expand(state: &mut State, loc: &Location, rule: Option<&TargetRule>, stack: &
                 }
                 SubType::Warn => {
                     eprintln!("{}:{}: {}", loc.file_name, loc.line, var_name);
+                }
+                SubType::BaseName => {
+                    let names = var_name.split_whitespace().rev();
+                    for name in names {
+                        let mut rev = name.chars().rev().peekable();
+                        let mut purged = String::new();
+                        let mut no_dot = false;
+                        while match rev.peek() {
+                            Some('.') => {
+                                rev.next();
+                                false
+                            }
+                            Some('/') => {
+                                no_dot = true;
+                                false
+                            }
+                            Some(_) => {
+                                purged.push(rev.next().unwrap_or_else(|| unreachable!()));
+                                true
+                            }
+                            None => {
+                                no_dot = true;
+                                false
+                            }
+                        } {}
+                        if no_dot {
+                            stack.extend(purged.chars());
+                        }
+                        stack.extend(rev);
+                        stack.push(' ');
+                    }
+                }
+                SubType::Suffix => {
+                    let names = var_name.split_whitespace().rev();
+                    for name in names {
+                        let mut rev = name.chars().rev().peekable();
+                        let mut purged = String::new();
+                        let mut no_dot = false;
+                        while match rev.peek() {
+                            Some('/') => {
+                                no_dot = true;
+                                false
+                            }
+                            Some(&a) => {
+                                purged.push(rev.next().unwrap_or_else(|| unreachable!()));
+                                a != '.'
+                            }
+                            None => {
+                                no_dot = true;
+                                false
+                            }
+                        } {}
+                        if !no_dot {
+                            stack.extend(purged.chars());
+                        }
+                        stack.push(' ');
+                    }
+                }
+                SubType::AddPrefix => {
+                    let mut args = var_name.split(",");
+                    let prefix = args.next().unwrap();
+                    let names = args
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .map(|x| format!("{}{}", prefix, x))
+                        .fold(String::new(), |s, x| format!("{} {}", s, x));
+                    stack.extend(names.chars().rev());
+                }
+                SubType::AddSuffix => {
+                    let mut args = var_name.split(",");
+                    let suffix = args.next().unwrap();
+                    let names = args
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .map(|x| format!("{}{}", x, suffix))
+                        .fold(String::new(), |s, x| format!("{} {}", s, x));
+                    stack.extend(names.chars().rev());
+                }
+                SubType::Sort => {
+                    let mut args = var_name.split_whitespace().collect::<Vec<_>>();
+                    args.sort();
+                    args.dedup();
+                    for arg in args.into_iter().rev() {
+                        stack.extend(arg.chars().rev());
+                        stack.push(' ');
+                    }
+                }
+                SubType::FirstWord => {
+                    stack.extend(
+                        var_name
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .rev(),
+                    );
+                }
+                SubType::LastWord => {
+                    stack.extend(
+                        var_name
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or_default()
+                            .chars()
+                            .rev(),
+                    );
+                }
+                SubType::Words => {
+                    stack.extend(
+                        var_name
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .len()
+                            .to_string()
+                            .chars()
+                            .rev(),
+                    );
+                }
+                SubType::Join => {
+                    let mut args = var_name.split(',');
+                    let a1 = args.next().unwrap().split_whitespace().rev();
+                    let a2 = args.next().unwrap().split_whitespace().rev();
+                    for (a, b) in a1.zip(a2) {
+                        stack.extend(format!("{}{}", a, b).chars().rev());
+                        stack.push(' ');
+                    }
+                }
+                SubType::NotDir => {
+                    let names = var_name.split_whitespace().rev();
+                    for name in names {
+                        let mut rev = name.chars().rev().peekable();
+                        let mut purged = String::new();
+                        while match rev.peek() {
+                            Some('/') => false,
+                            Some(_) => {
+                                purged.push(rev.next().unwrap());
+                                true
+                            }
+                            None => false,
+                        } {}
+                        stack.extend(purged.chars());
+                        stack.push(' ');
+                    }
+                }
+                SubType::Dir => {
+                    let names = var_name.split_whitespace().rev();
+                    for name in names {
+                        let mut rev = name.chars().rev().peekable();
+                        let mut purged = String::new();
+                        let mut no_slash = false;
+                        while match rev.peek() {
+                            Some('/') => false,
+                            Some(_) => {
+                                purged.push(rev.next().unwrap());
+                                true
+                            }
+                            None => {
+                                no_slash = true;
+                                false
+                            }
+                        } {}
+                        if no_slash {
+                            stack.push('/');
+                            stack.push('.');
+                        } else {
+                            stack.extend(rev);
+                        }
+                        stack.push(' ');
+                    }
                 }
             }
         }
@@ -527,15 +774,22 @@ fn process_lines(state: &mut State, file_name: &str) {
         match line {
             l if l.starts_with(recipie_prefix) && state.in_rule => {
                 let r = match state.rules.last() {
-                    Some(Rule { targets, data: RuleData::Prereq(..), .. }) | Some(Rule { targets, data: RuleData::Recipie(..), .. }) => {
-                        Rule {
-                            location: location.clone(),
-                            targets: targets.clone(),
-                            data: RuleData::Recipie(l)
-                        }
-                    }
+                    Some(Rule {
+                        targets,
+                        data: RuleData::Prereq(..),
+                        ..
+                    })
+                    | Some(Rule {
+                        targets,
+                        data: RuleData::Recipie(..),
+                        ..
+                    }) => Rule {
+                        location: location.clone(),
+                        targets: targets.clone(),
+                        data: RuleData::Recipie(l),
+                    },
 
-                    _ => panic!()
+                    _ => panic!(),
                 };
                 state.rules.push(r);
             }
@@ -576,6 +830,25 @@ fn process_lines(state: &mut State, file_name: &str) {
                             Some('=') => {
                                 context = Context::Var(out);
                                 out = String::new();
+                            }
+                            Some(':') => {
+                                match stack.pop() {
+                                    Some('=') => {
+                                        context = Context::Var(out);
+                                        out = String::new();
+                                    }
+                                    Some(a) => {
+                                        context = Context::Rule(out, None, Vec::new());
+                                        out = String::new();
+                                        stack.push(a);
+                                        stop_expanding = true;
+                                    }
+                                    None => {
+                                        context = Context::Rule(out, None, Vec::new());
+                                        out = String::new();
+                                        stop_expanding = true;
+                                    }
+                                }
                             }
                             Some(a) => {
                                 context = Context::Rule(out, None, Vec::new());
@@ -738,7 +1011,6 @@ fn process_target(state: &mut State, name: &str) {
                             panic!();
                         }
 
-                        eprintln!("WARNING: overwriting previous recipies for {}", name);
                         recipies = Vec::new();
                     }
                     was_recipies = true;
@@ -779,7 +1051,7 @@ fn process_target(state: &mut State, name: &str) {
 
     if needs_updating {
         let mut expanded = Vec::new();
-        
+
         for (loc, r) in &recipies {
             let mut stack: String = r.chars().rev().collect();
             let mut cmd = String::new();
@@ -817,7 +1089,7 @@ fn process_target(state: &mut State, name: &str) {
                 state.ignore_errors
             };
 
-            let mut silent = false;
+            let mut silent = state.silent_targets.contains(&name.to_string());
 
             if cmd.starts_with('@') {
                 cmd = &cmd[1..];
@@ -830,32 +1102,33 @@ fn process_target(state: &mut State, name: &str) {
 
             let cmd_name = cmd.trim().split_ascii_whitespace().next().unwrap();
             let cnf_status = Command::new("/bin/sh")
+                .arg0(&state.basename)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .envs(state.vars.iter())
                 .arg("-c")
                 .arg(format!("command -V {}", cmd_name))
                 .status()
                 .expect("command failed");
             if !cnf_status.success() {
-                eprintln!("{}: {}: No such file or directory", state.basename, cmd_name);
-                
+                eprintln!(
+                    "{}: {}: No such file or directory",
+                    state.basename, cmd_name
+                );
+
                 if ignore_errors {
                     eprintln!(
                         "{}: [{}:{}: {}] Error 127 (ignored)",
-                        state.basename,
-                        loc.file_name,
-                        loc.line,
-                        name,
+                        state.basename, loc.file_name, loc.line, name,
                     );
                 } else {
                     eprintln!(
                         "{}: *** [{}:{}: {}] Error 127",
-                        state.basename,
-                        loc.file_name,
-                        loc.line,
-                        name,
+                        state.basename, loc.file_name, loc.line, name,
                     );
-                    std::process::exit(2);
+                    if !state.keep_going {
+                        std::process::exit(2);
+                    }
                 }
                 continue;
             }
@@ -863,16 +1136,28 @@ fn process_target(state: &mut State, name: &str) {
             let mut leaving = None;
 
             if !silent && cmd_name == state.fullname {
-                println!("{}[1]: Entering directory '{}'", state.basename, state.curdir);
-                leaving = Some(format!("{}[1]: Leaving directory '{}'", state.basename, state.curdir));
+                println!(
+                    "{}[1]: Entering directory '{}'",
+                    state.basename, state.curdir
+                );
+                leaving = Some(format!(
+                    "{}[1]: Leaving directory '{}'",
+                    state.basename, state.curdir
+                ));
             } else {
             }
 
-            
-
             let status = Command::new("/bin/sh")
+                .arg0(&state.basename)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
+                .envs(state.vars.clone().into_iter().map(|(x, y)| {
+                    if x == "MAKELEVEL" {
+                        (x, (y.parse::<u32>().unwrap() + 1).to_string())
+                    } else {
+                        (x, y)
+                    }
+                }))
                 .arg("-c")
                 .arg(cmd)
                 .status()
@@ -896,11 +1181,38 @@ fn process_target(state: &mut State, name: &str) {
                         name,
                         status.code().unwrap_or_default()
                     );
-                    std::process::exit(2);
+                    if !state.keep_going {
+                        std::process::exit(2);
+                    }
                 }
             } else if let Some(s) = leaving {
                 println!("{}", s);
             }
         }
+    }
+}
+
+// TODO: symbol table
+// Need a proper symbol table that keeps track of variable flavours, expands only when needed,
+// and updates the environment.
+//
+// Perhaps scopes are needed
+//
+// TODO: process launching utilities
+
+/// Keep track of defined variables
+struct SymbolTable {}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn set(name: &str, value: &str) {
+        std::env::set_var(name, value)
+    }
+
+    pub fn get(name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
     }
 }
