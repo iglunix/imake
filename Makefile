@@ -1,5 +1,7 @@
+RUSTC=rustc
+
 target/debug/imake: src/main.rs
-	cargo build
+	$(RUSTC) -o $@ $^
 
 clean:
-	cargo clean
+	rm -f target/debug/imake
