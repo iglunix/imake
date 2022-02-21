@@ -18,6 +18,7 @@ mod expand;
 // Global makefile state
 #[derive(Default, Debug)]
 struct State {
+    debug: bool,
     fullname: String,
     basename: String,
     dirname: String,
@@ -35,6 +36,11 @@ struct State {
     phony: Vec<String>,
     silent_targets: Vec<String>,
     processed: Vec<String>,
+}
+
+fn fatal_double_and_single(loc: &Location, target: &str) -> ! {
+    println!("{}:{}: *** target file '{}' has both : and :: entries.  Stop", loc.file_name, loc.line, target);
+    std::process::exit(2)
 }
 
 fn fatal_arg_count(loc: &Location, given: usize, func: &str) -> ! {
@@ -117,6 +123,8 @@ fn main() -> Result<(), u32> {
     ];
 
     let mut state = State::default();
+    state.debug = matches!(std::env::var("IMAKE_DEBUG").as_ref().map(|x| x.as_str()), Ok("1"));
+    
     let mut vars = HashMap::new();
 
     let mpath: String = args.next().unwrap().trim().into();
@@ -363,7 +371,7 @@ fn process_for_shell(src: &str) -> String {
 }
 
 /// Read a logical makefile line and discard after comment
-fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut usize) -> String {
+fn read_logical_line(state: &State, file: &mut BufReader<File>, eof: &mut bool, line_no: &mut usize) -> String {
     let mut line: String = String::new();
 
     let mut needs_line = true;
@@ -381,7 +389,11 @@ fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut u
             if tmp_line.starts_with('#') {
                 continue;
             }
-            let mut chars = tmp_line.chars().peekable();
+            let mut chars = if line.is_empty() {
+                tmp_line.chars().peekable()
+            } else {
+                tmp_line.trim().chars().peekable()
+            };
 
             if matches!(chars.peek(), Some('\u{feff}')) {
                 chars.next();
@@ -398,7 +410,7 @@ fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut u
             let mut in_dquote = false;
             while let Some(c) = chars.next() {
                 match (in_quote, in_dquote, sub_depth, c) {
-                    (false, false, 0, '#') => discard = true,
+                    // (false, false, 0, '#') => discard = true,
                     (false, false, _, '$') => {
                         line.push('$');
 
@@ -432,6 +444,12 @@ fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut u
                         line.push('"');
                     }
                     (a, b, _, '\\') if a | b => {
+                        match chars.peek() {
+                            Some('\n') => {
+                                needs_line = true;
+                            },
+                            _ => {}
+                        }
                         line.push('\\');
                         line.push(chars.next().unwrap());
                     }
@@ -441,15 +459,19 @@ fn read_logical_line(file: &mut BufReader<File>, eof: &mut bool, line_no: &mut u
                         _ => {}
                     },
                     (_, _, _, a) => {
-                        if !discard {
+                        //if !discard {
                             line.push(a);
-                        }
+                        //}
                     }
                 }
             }
         } else {
             *eof = true;
         }
+    }
+
+    if state.debug {
+        eprintln!("logical line: {}", line);
     }
 
     line
@@ -460,7 +482,7 @@ fn process_specials(state: &mut State, vars: &mut HashMap<String, Var>) {
         if let Some(first_target) = t.targets.get(0) {
             match first_target.as_str() {
                 ".SILENT" => {
-                    if let RuleData::Prereq(prereqs) = &t.data {
+                    if let RuleData::Prereq(_, prereqs) = &t.data {
                         let prereqs = expand_simple_ng(state, vars, &t.location, prereqs);
                         state
                             .silent_targets
@@ -471,7 +493,7 @@ fn process_specials(state: &mut State, vars: &mut HashMap<String, Var>) {
                 }
 
                 ".PHONY" => {
-                    if let RuleData::Prereq(prereqs) = &t.data {
+                    if let RuleData::Prereq(_, prereqs) = &t.data {
                         let prereqs = expand_simple_ng(state, vars, &t.location, prereqs);
                         state
                             .phony
@@ -492,7 +514,7 @@ fn select_targets(state: &mut State, vars: &mut HashMap<String, Var>) -> Vec<Str
         let first_target = first_target.unwrap_or_default();
         match t {
             Rule {
-                data: RuleData::Prereq(prereqs),
+                data: RuleData::Prereq(_, prereqs),
                 ..
             } if first_target == ".DEFAULT" => {
                 let prereqs = expand_simple_ng(state, vars, &t.location, prereqs);
@@ -514,6 +536,8 @@ fn state_machine(mut state: State, mut vars: HashMap<String, Var>, file: &str) -
     process_lines(&mut state, &mut vars, file);
 
     process_specials(&mut state, &mut vars);
+
+    build_graph(&mut state, &mut vars);
 
     let mut targets_to_make = state.targets_to_make.clone();
 
@@ -570,6 +594,8 @@ pub struct Var {
     name: String,
     value: String,
     exported: bool,
+    unexported: bool,
+    ex_exported: bool
 }
 
 impl Var {
@@ -588,6 +614,8 @@ impl Var {
             name,
             value,
             exported,
+            unexported: false,
+            ex_exported: false
         };
         ret.sync_env();
         ret
@@ -595,11 +623,13 @@ impl Var {
 
     pub fn export(&mut self) {
         self.exported = true;
+        self.ex_exported = true;
         self.sync_env();
     }
 
     pub fn unexport(&mut self) {
         self.exported = false;
+        self.unexported = true;
         std::env::remove_var(&self.name);
     }
 
@@ -627,6 +657,10 @@ impl Var {
                 state,
                 vars,
                 self.loc.as_ref().unwrap_or(location),
+                // TODO: errors should not use the var location but instead should use the line location
+                // for errors
+                //
+                // location,
                 &self.value,
             ),
             Flavor::Undefined | Flavor::Simple => self.value.clone(),
@@ -678,7 +712,7 @@ fn process_lines(state: &mut State, vars: &mut HashMap<String, Var>, file_name: 
     // TODO: .RECIPIEPREFIX
     let recipie_prefix = '\t';
     while !eof {
-        let line = read_logical_line(&mut file, &mut eof, &mut location.line);
+        let line = read_logical_line(state, &mut file, &mut eof, &mut location.line);
         // eprintln!("processing logical line: {}: in rule: {}", line.trim(), state.in_rule);
         //
         if let Some((v_name, op, buf)) = &mut in_define {
@@ -734,6 +768,9 @@ fn process_lines(state: &mut State, vars: &mut HashMap<String, Var>, file_name: 
                 in_false += 1;
             } else if line.trim().starts_with("endif") {
                 in_false -= 1;
+
+
+                
             } else if in_false == 1 && !found_true && line.trim().starts_with("else") {
                 let line = line.trim()[4..].trim();
                 if line.len() == 0 {
@@ -928,7 +965,7 @@ enum VarOp {
 
 #[derive(Debug, Clone)]
 enum RuleData {
-    Prereq(String),
+    Prereq(bool, String),
     Var(String, VarOp, String),
     Recipie(String),
 }
@@ -940,6 +977,95 @@ struct TargetRule {
     target: String,
     vars: HashMap<String, String>,
     prerequisites: Vec<String>,
+}
+
+fn build_graph(state: &mut State, vars: &HashMap<String, Var>) {
+    enum RuleType {
+        Implicit,
+        Phony,
+        File
+    }
+    // types of rules
+    //
+    //  - add a prereq (these should all be resolved)
+    //
+    #[derive(Debug, Clone, Default)]
+    struct GraphEntry {
+        rule_name: String,
+        // List of prerequisites. If a prerequisite is a file
+        // not created by any target. Then graph[i]
+        prereqs: Vec<String>,
+        phony: bool,
+        recipies: Vec<String>,
+        vars: Vec<Var>
+    }
+
+    // Vec for double colons
+    let mut str_lut = HashMap::<String, Vec<usize>>::new();
+    
+    let mut graph = Vec::<GraphEntry>::new();
+    for rule in &state.rules{
+        match rule {
+            Rule { targets, data: RuleData::Prereq(double_colon, prereq), .. } => {
+                for target in targets {
+                    match str_lut.get_mut(target) {
+                        Some(target) if !double_colon => {
+                            graph[target[0]].prereqs.extend(prereq.split_whitespace().map(|x| x.to_string()));
+                        }
+                        Some(target_ids) if *double_colon => {
+                            target_ids.push(graph.len());
+                            graph.push(GraphEntry {
+                                rule_name: target.to_string(),
+                                prereqs: prereq.split_whitespace().map(|x| x.to_string()).collect(),
+                                phony: false,
+                                recipies: Vec::new(),
+                                vars: Vec::new()
+                            });
+                        }
+                        Some(_) => unreachable!(),
+                        None => {
+                            str_lut.insert(target.to_string(), vec![graph.len()]);
+                            graph.push(GraphEntry {
+                                rule_name: target.to_string(),
+                                prereqs: prereq.split_whitespace().map(|x| x.to_string()).collect(),
+                                phony: false,
+                                recipies: Vec::new(),
+                                vars: Vec::new()
+                            });
+                        }
+                    }
+                }
+            }
+            Rule { targets, data: RuleData::Recipie(recipie), .. } => {
+                for target in targets {
+                    match str_lut.get_mut(target) {
+                        Some(target) => {
+                            graph[target[target.len() - 1]].recipies.push(recipie.to_string());
+                        }
+                        None => {
+                            panic!();
+                            // TODO: unreachable!()
+                        }
+                    }
+                }
+            }
+            Rule { targets, data: RuleData::Var(lhs, op, rhs), .. } => {
+                for target in targets {
+                    match str_lut.get_mut(target) {
+                        Some(target) => {
+
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => ()
+        }
+    }
+
+    if state.debug {
+        eprintln!("{:#?}", graph);
+    }
 }
 
 fn process_target(
@@ -984,6 +1110,10 @@ fn process_target(
     let mut was_prereq = false;
     let mut was_recipies = false;
     let mut found_rules = false;
+
+    let mut was_single = false;
+    let mut was_double = false;
+
     for rule in &state.rules.clone() {
         if rule.targets.contains(&name.to_owned()) {
             found_rules |= true;
@@ -993,8 +1123,17 @@ fn process_target(
                     was_prereq = false;
                     was_recipies = false;
                 }
-                RuleData::Prereq(prereqs) => {
+                RuleData::Prereq(a, prereqs) => {
                     // let prereqs = expand_simple_ng(state, &mut vars, &rule.location, prereqs);
+                    if *a && was_single {
+                        fatal_double_and_single(&rule.location, name);
+                    } else if !*a && was_double {
+                        fatal_double_and_single(&rule.location, name);
+                    } else if *a {
+                        was_double = true;
+                    } else {
+                        was_single = true;
+                    }
 
                     prereqs_var.append(&prereqs);
 
@@ -1008,9 +1147,9 @@ fn process_target(
                     if !recipies.is_empty() && !was_recipies {
                         if !was_prereq {
                             panic!();
+                        } else if !was_double {
+                            recipies = Vec::new();
                         }
-
-                        recipies = Vec::new();
                     }
                     was_recipies = true;
                     was_prereq = false;
@@ -1251,7 +1390,8 @@ fn expand_ng(
         PatSubst,
         SubstRef,
         Strip,
-        WildCard
+        WildCard,
+        Value
     }
 
     #[cfg(debug_assertions)]
@@ -1409,6 +1549,10 @@ fn expand_ng(
                             "wildcard" => {
                                 arg = String::new();
                                 SubType::WildCard
+                            }
+                            "value" => {
+                                arg = String::new();
+                                SubType::Value
                             }
                             _ => SubType::Var,
                         };
@@ -1710,6 +1854,7 @@ fn expand_ng(
                     }
                 }
                 SubType::Error => {
+                    let arg = expand_simple_ng(state, vars, loc, &arg);
                     eprintln!("{}:{}: *** {}.  Stop.", loc.file_name, loc.line, arg.trim());
                     std::process::exit(2);
                 }
@@ -2028,6 +2173,14 @@ fn expand_ng(
                     out.pop();
                     out
                 }
+                SubType::Value => {
+                    let arg = expand_simple_ng(state, vars, loc, &arg);
+                    if let Some(v) = vars.get(arg.trim()) {
+                        v.value.clone()
+                    } else {
+                        String::new()
+                    }
+                }
                 _ => todo!(),
             }
         }
@@ -2162,9 +2315,17 @@ fn parse_line(state: &mut State, vars: &mut HashMap<String, Var>, location: &Loc
         src = rhs
     }
 
-    if targets.is_none() && src.trim().starts_with("unexport") {
+    if targets.is_none() && src.trim().starts_with("unexport ") {
         for var in expand_simple_ng(state, vars, location, &src.trim()[9..]).split_whitespace() {
             if let Some(var) = vars.get_mut(var) {
+                var.unexport();
+            }
+        }
+    } else if targets.is_none() && src.trim().starts_with("unexport") {
+        for var in vars.values_mut() {
+            // Don't implicitly unexport if explicitly exported
+            // TODO: check soundness of exporting and unexporting
+            if !var.exported && !matches!(var.origin, Origin::Env) {
                 var.unexport();
             }
         }
@@ -2172,8 +2333,10 @@ fn parse_line(state: &mut State, vars: &mut HashMap<String, Var>, location: &Loc
         // FIXME:
         // GNU make handles export X Y=1 as prereqs. we handle it as
         // export the var `X Y` and set it to `1`
-        let (export, src) = if src.trim().starts_with("export") {
+        let (export, src) = if src.trim().starts_with("export ") {
             (true, &src.trim()[7..])
+        } else if src.trim().starts_with("export") {
+            (true, "")
         } else {
             (false, src)
         };
@@ -2414,7 +2577,6 @@ fn parse_line(state: &mut State, vars: &mut HashMap<String, Var>, location: &Loc
             // multiple recipies can be handled by shell `;`. this allows for `@cmd; cmd; cmd`
             // to be handled properly
             let (prereqs, recipie) = {
-
                 if let Some((prereqs, recpie)) = src.split_once(';') {
                     (prereqs, Some(recpie))
                 } else {
@@ -2430,7 +2592,7 @@ fn parse_line(state: &mut State, vars: &mut HashMap<String, Var>, location: &Loc
             state.rules.push(Rule {
                 location: location.clone(),
                 targets: targets.clone(),
-                data: RuleData::Prereq(prereqs),
+                data: RuleData::Prereq(double_colon, prereqs),
             });
             if let Some(r) = recipie {
                 state.rules.push(Rule {
@@ -2440,9 +2602,19 @@ fn parse_line(state: &mut State, vars: &mut HashMap<String, Var>, location: &Loc
                 })
             }
         } else if export {
+            let mut export_all = true;
             for var in expand_simple_ng(state, vars, location, src).split_whitespace() {
+                export_all = false;
                 if let Some(var) = vars.get_mut(var) {
                     var.export();
+                }
+            }
+            if export_all {
+                for var in vars.values_mut() {
+                    // Don't implicitly export if explicitly unexported
+                    if !var.unexported {
+                        var.export();
+                    }
                 }
             }
         } else {
