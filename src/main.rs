@@ -407,9 +407,15 @@ fn read_logical_line(state: &State, file: &mut BufReader<File>, eof: &mut bool, 
             let mut in_quote = false;
             let mut in_dquote = false;
             while let Some(c) = chars.next() {
-                match (in_quote, in_dquote, sub_depth, c) {
-                    // (false, false, 0, '#') => discard = true,
-                    (false, false, _, '$') => {
+                match (in_quote, in_dquote, discard, sub_depth, c) {
+                    (false, false, false, 0, '#') => {
+                        discard = true;
+                        line.push('\n');
+                    }
+                    (false, false, true, 0, '\n') => {
+                        discard = false;
+                    }
+                    (false, false, false, _, '$') => {
                         line.push('$');
 
                         match chars.peek() {
@@ -427,40 +433,43 @@ fn read_logical_line(state: &State, file: &mut BufReader<File>, eof: &mut bool, 
                         }
                     }
 
-                    (false, false, _, a) if a == '}' || a == ')' => {
+                    (false, false, false, _, a) if a == '}' || a == ')' => {
                         sub_depth -= 1;
                         line.push(a);
                     }
 
-                    (a, false, _, '\'') => {
+                    (a, false, false, _, '\'') => {
                         in_quote = !a;
                         line.push('\'');
                     }
 
-                    (false, a, _, '"') => {
+                    (false, a, false, _, '"') => {
                         in_dquote = !a;
                         line.push('"');
                     }
-                    (a, b, _, '\\') if a | b => {
+                    (a, b, false, _, '\\') if a | b => {
                         match chars.peek() {
                             Some('\n') => {
                                 needs_line = true;
-                            },
+                            }
                             _ => {}
                         }
                         line.push('\\');
                         line.push(chars.next().unwrap());
                     }
-                    (false, false, _, '\\') => match chars.next() {
+                    (false, false, false, _, '\\') => match chars.next() {
                         Some('\\') => line.push('\\'),
                         Some('\n') => needs_line = true,
                         _ => {}
                     },
-                    (_, _, _, a) => {
-                        //if !discard {
-                            line.push(a);
-                        //}
+                    (false, false, true, _, '\\') => match chars.next() {
+                        Some('\n') => needs_line = true,
+                        _ => {}
+                    },
+                    (_, _, false, _, a) => {
+                        line.push(a);
                     }
+                    (_, _, true, _, a) => {}
                 }
             }
         } else {
