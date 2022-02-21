@@ -13,8 +13,6 @@ use std::{
 
 use glob;
 
-mod expand;
-
 // Global makefile state
 #[derive(Default, Debug)]
 struct State {
